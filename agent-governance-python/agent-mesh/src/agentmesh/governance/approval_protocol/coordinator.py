@@ -19,8 +19,10 @@ and returns a machine-readable reason code.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from functools import wraps
 from typing import Callable, Iterable, Optional
 
 from .binding import ActionBinding
@@ -41,6 +43,10 @@ from .store import ApprovalStore
 
 class ApprovalProtocolError(Exception):
     """Raised when a request cannot be created or an entry cannot be recorded."""
+
+
+class _ExpiredSubmissionError(ApprovalProtocolError):
+    """Internal marker: commit persisted expiry before reporting rejection."""
 
 
 class ReasonCode:
@@ -132,6 +138,40 @@ class ApprovalChain:
         return None
 
 
+def _atomic_approval_submission(func):
+    """Use atomic stores; warn for legacy stores, or reject in opt-in strict mode."""
+
+    @wraps(func)
+    def guarded(self, approval_request_id, *args, **kwargs):
+        transaction = getattr(self.store, "approval_transaction", None)
+        if callable(transaction):
+            expired_error = None
+            with transaction(approval_request_id):
+                try:
+                    return func(self, approval_request_id, *args, **kwargs)
+                except _ExpiredSubmissionError as exc:
+                    # Expiry records are terminal state changes, not failed writes.
+                    # Commit them before raising the normal public error.
+                    expired_error = exc
+            if expired_error is not None:
+                raise expired_error
+        if self.require_atomic_submission:
+            raise ApprovalProtocolError(
+                "approval store has no approval_transaction; strict atomic "
+                "submission requires a transactional backend"
+            )
+        warnings.warn(
+            "Legacy ApprovalStore has no approval_transaction: concurrent "
+            "submissions may invalidate the hash chain; migrate to "
+            "AtomicApprovalStore or enable require_atomic_submission",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return func(self, approval_request_id, *args, **kwargs)
+
+    return guarded
+
+
 @dataclass
 class ApprovalCoordinator:
     """Creates, advances, and validates action-bound approval requests."""
@@ -139,6 +179,7 @@ class ApprovalCoordinator:
     store: ApprovalStore
     chains: dict[str, ApprovalChain]
     clock: Callable[[], datetime] = field(default=utcnow)
+    require_atomic_submission: bool = False
 
     # -- creation -----------------------------------------------------------
 
@@ -188,6 +229,7 @@ class ApprovalCoordinator:
 
     # -- advancing the chain ------------------------------------------------
 
+    @_atomic_approval_submission
     def submit_entry(
         self,
         approval_request_id: str,
@@ -218,7 +260,7 @@ class ApprovalCoordinator:
                     return existing
 
         if self._expire_if_due(request):
-            raise ApprovalProtocolError("approval request has expired")
+            raise _ExpiredSubmissionError("approval request has expired")
         if request.status != ApprovalStatus.PENDING:
             raise ApprovalProtocolError(
                 f"approval request is not pending (status={request.status.value})"
@@ -273,9 +315,7 @@ class ApprovalCoordinator:
                 self._resolve(request, Outcome.DENY, entry.entry_digest)
                 return
 
-        allowed_stages = {
-            e.stage_index for e in entries if e.decision == EntryDecision.ALLOW
-        }
+        allowed_stages = {e.stage_index for e in entries if e.decision == EntryDecision.ALLOW}
         required = {s.stage_index for s in chain.stages if s.required}
         # A chain without required stages is misconfigured and must fail closed.
         if not required:

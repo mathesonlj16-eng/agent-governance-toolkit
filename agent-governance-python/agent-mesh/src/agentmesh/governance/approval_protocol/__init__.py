@@ -68,7 +68,7 @@ from .models import (
     Verdict,
     utcnow,
 )
-from .store import ApprovalStore, InMemoryApprovalStore
+from .store import ApprovalStore, AtomicApprovalStore, InMemoryApprovalStore
 
 __all__ = [
     # digest
@@ -93,6 +93,7 @@ __all__ = [
     # store
     "ApprovalStore",
     "InMemoryApprovalStore",
+    "AtomicApprovalStore",
     # coordinator
     "ApprovalCoordinator",
     "ApprovalChain",

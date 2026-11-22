@@ -13,6 +13,7 @@ tests and single-process embedders.
 from __future__ import annotations
 
 import threading
+from contextlib import AbstractContextManager, contextmanager
 from typing import Optional, Protocol, runtime_checkable
 
 from .models import (
@@ -51,6 +52,15 @@ class ApprovalStore(Protocol):
         ...
 
 
+@runtime_checkable
+class AtomicApprovalStore(ApprovalStore, Protocol):
+    """Optional stronger store interface. ApprovalStore stays backwards compatible."""
+
+    def approval_transaction(self, approval_request_id: str) -> AbstractContextManager[None]:
+        """Serialize a complete approval submission across all worker processes."""
+        ...
+
+
 class InMemoryApprovalStore:
     """Thread-safe, in-process :class:`ApprovalStore` reference implementation."""
 
@@ -59,6 +69,12 @@ class InMemoryApprovalStore:
         self._requests: dict[str, ApprovalRequest] = {}
         self._entries: dict[str, list[ApprovalChainEntry]] = {}
         self._resolutions: dict[str, ApprovalResolution] = {}
+
+    @contextmanager
+    def approval_transaction(self, approval_request_id: str):
+        """Serialize votes on a shared in-memory store (single process only)."""
+        with self._lock:
+            yield
 
     def save_request(self, request: ApprovalRequest) -> None:
         with self._lock:
